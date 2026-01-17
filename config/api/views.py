@@ -9,8 +9,8 @@ import pandas as pd
 import numpy as np
 from django.db import transaction
 from django.contrib.auth import authenticate
-from .models import Transcations
-from .serializers import TransactionSerializer
+from .models import Transcations,Category,VersionHistory 
+from .serializers import TransactionSerializer,VersionHistorySearlizer
 from django.db.models import Sum
 from datetime import datetime
 import pdfplumber
@@ -56,33 +56,48 @@ def get_transcations(request):
                 user=user
             )
         filtered_transactions = data.filter(
-            Q(category__icontains=searched_text)
+            Q(category__name__icontains=searched_text)
             | Q(merchant__icontains=searched_text)
             | Q(type__icontains=searched_text)
+            | Q(ref_no__icontains=searched_text)
         )
-        print(filtered_transactions)
+        # print(filtered_transactions.select_related("category"))
         serailizedObject = TransactionSerializer(filtered_transactions, many=True)
         return Response({"data": serailizedObject.data},status=status.HTTP_200_OK)
     except Exception as e:
         return Response({"error": str(e)},status=status.HTTP_417_EXPECTATION_FAILED)
+    
+def color_gen():
+    letters = '0123456789ABCDEF'
+    color = '#'
+    existing_colors=[]
+
+    for c in Category.objects.all():
+        print(c)
+        existing_colors.append(c.color)
+
+    for _ in range(6):
+        color += random.choice(letters) 
+
+    if existing_colors.__contains__(color):
+        return color_gen()    
+    return color   
+
 
 color_for_categories = {}    
 
 def getColors(category):
+    # print(list(Category.objects.all()))
+
     if category in color_for_categories:
         return color_for_categories[category]
     else:
-        letters = '0123456789ABCDEF'
-        color = '#'
-
-        for _ in range(6):
-            color += random.choice(letters)
-
+        color = color_gen()
         color_for_categories[category] = color
         return color_for_categories[category]
 
 
-def generic_formatter(df,user):
+def generic_formatter(df,user,file):
     # print(df)
     # Convert date column to proper datetime.date
     df["date"] = pd.to_datetime(df["date"],dayfirst=True , errors="coerce").dt.date
@@ -98,10 +113,58 @@ def generic_formatter(df,user):
     df["color"] = df["category"].apply(getColors)
     df["currency"] = "inr"
     df['user'] = user
-    print(df)
+
+    category_names = df['category'].dropna().astype('str').str.strip().str.upper().replace("",np.nan).dropna().unique()
+
+    existing_categories = Category.objects.filter(name__in=category_names)
+
+    category_map = {c.name : c for c in existing_categories}
+
+    verision =VersionHistory.objects.create(file_name=file.name,user=user)
+
+
+    new_categories = [
+        Category(name=name,color=getColors(name),uploaded_version=verision)
+        for name in category_names
+        if name not in category_map
+    ]
+
+    Category.objects.bulk_create(new_categories)
+
+    all_categories = Category.objects.filter(name__in=category_names)
+
+    category_map = {c.name : c for c in all_categories}
+
+    transactions = []
+
+    # df['category'] = category_map.get(df['category'])
+    # Category.objects
+
+    for row in df.to_dict(orient="records"):
+        transactions.append(
+            Transcations(
+                user = user,
+                ref_no = row["ref_no"],
+                date=row["date"],
+                value_date=row["value_date"],
+                narration=row["narration"],
+                debit_amount=row["debit_amount"],
+                credit_amount=row["credit_amount"],
+                closing_balance=row["closing_balance"],
+                amount=row["amount"],
+                merchant=row["merchant"],
+                category=category_map.get(row['category']),
+                uploaded_version=verision,
+                currency="inr",
+                type=row["type"] 
+            )
+        )
+
+    with transaction.atomic():
+        Transcations.objects.bulk_create(transactions,ignore_conflicts=False)
+
+    print(transactions)
     
-
-
     return df
 
 
@@ -113,7 +176,7 @@ def upload_transcations(request):
     user = request.user
     file = request.FILES['file']
     file_extension = os.path.splitext(file.name)[1]
-    print(file_extension)
+    # print(file_extension)
     if file_extension == '.pdf':
         try:
             import_pdf(file,user=user)
@@ -124,6 +187,9 @@ def upload_transcations(request):
         try:
             # Read Excel, skip first 20 rows and last 16 rows
             df = pd.read_excel(file, skiprows=20, skipfooter=16, header=0)
+
+
+            # print(dr.id,'djididhiu')
 
             # Rename columns to match your model
             df = df.rename(columns={
@@ -141,14 +207,9 @@ def upload_transcations(request):
             cleaned = df['narration'].str.replace(r'\d+', '', regex=True)
             df['category'] = np.where(df['narration'].str.contains("EMI|POS|INTEREST",case=False,na=False), cleaned.str.split(' ',n=1).str[0], cleaned.str.split('-',n=1).str[0])
             df['merchant'] = np.where(df['narration'].str.contains("EMI|INTEREST",case=False,na=False), cleaned.str.split(' ',n=2).str[1], np.where(df['narration'].str.contains("POS",case=False,na=False), cleaned.str.split(' ').str[2:].str.join(" "), cleaned.str.split('-',n=2).str[1]))
-
-            df = generic_formatter(df,user=user)
-            # print(df['category'],)
-            # # Bulk insert safely using transaction
-            with transaction.atomic():
-                Transcations.objects.bulk_create(
-                    [Transcations(**row) for row in df.to_dict(orient='records')]
-                )
+            # print(df,'skisj')
+            df = generic_formatter(df,user=user,file=file)
+            
 
             return Response({"message": "Transactions uploaded successfully"}, status=status.HTTP_200_OK)
 
@@ -188,7 +249,7 @@ def total_income_outgoes(request):
                 date__year=format_filter.year,
                 date__month=format_filter.month,
             ).filter(
-                Q(category__icontains=searched_text)
+                Q(category__name__icontains=searched_text)
                 | Q(merchant__icontains=searched_text)
                 | Q(type__icontains=searched_text)
             )
@@ -202,7 +263,7 @@ def total_income_outgoes(request):
             )
         else:
             trans = Transcations.objects.filter(user=user).filter(
-                Q(category__icontains=searched_text)
+                Q(category__name__icontains=searched_text) 
                 | Q(merchant__icontains=searched_text)
                 | Q(type__icontains=searched_text)
             )
@@ -268,11 +329,11 @@ def import_pdf(file,user):
                     cleaned.str.split("/", n=4).str[3],
                 ),
             )
-            finaldf = generic_formatter(df=finaldf,user=user)
-            with transaction.atomic():
-                Transcations.objects.bulk_create(
-                    [Transcations(**row) for row in finaldf.to_dict(orient='records')]
-                )
+            finaldf = generic_formatter(df=finaldf,user=user,file=file)
+            # with transaction.atomic():
+            #     Transcations.objects.bulk_create(
+            #         [Transcations(**row) for row in finaldf.to_dict(orient='records')]
+            #     )
 
 @api_view(['GET'])
 def get_filters(request):
@@ -291,3 +352,23 @@ def get_filters(request):
         return Response(result)
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    
+@api_view(["GET"])
+def get_uploaded_files(request):
+    try:
+        user = request.user
+        versions =  VersionHistorySearlizer(VersionHistory.objects.filter(user=user),many=True)
+        return Response({"data" : versions.data})
+    except Exception as e:
+        return Response({'error' : e})
+
+
+@api_view(["DELETE"])
+def delete_uploaded_file(request):
+    try:
+        # print(request.GET.get("id"))
+        delete_file = VersionHistory.objects.get(id=request.GET.get("id"))
+        delete_file.delete()
+        return Response({"Message" : "Successfully Deleted"})
+    except Exception as e :
+        return Response({'error' : str(e)})
